@@ -10,7 +10,7 @@ import numpy as np
 from math import factorial
 import matplotlib.pyplot as plt
 import lmfit
-from .sequencing import get_sequence, sync, ket2dm, ops2dms, tqdm
+from .sequencing import get_sequence, sync, ket2dm, ops2dms, tqdm, delay
 
 
 def fit_line(xs, ys):
@@ -60,6 +60,30 @@ def fit_displacement(xs, ys):
     model.set_param_hint("n", value=0)
 
     return model.fit(ys, xs=xs)
+
+def fit_repeated_pulse(xs, ys):
+    def repeated_pulses(xs, error=0, amp=1, ofs=0.5):
+        return ofs + amp * (-1)**(xs+1) * (np.pi * xs * error + 0.5 * np.pi * error)
+
+    model = lmfit.Model(repeated_pulses)
+    model.set_param_hint("error", value=0)
+    model.set_param_hint("ofs", value=0.5)
+    model.set_param_hint("amp", value=1.0, vary=False)
+
+    return model.fit(ys, xs=xs)
+
+def fit_repeated_drag(xs, ys):
+    def _repeated_drag(xs, error=0, ofs=0.5):
+        return ofs + 4 * error * xs
+
+    model = lmfit.Model(_repeated_drag)
+    model.set_param_hint("error", value=0)
+    model.set_param_hint("ofs", value=0.5)
+    # model.set_param_hint("amp", value=1.0)
+
+    return model.fit(ys, xs=xs)
+
+
 
 
 def tune_rabi(
@@ -149,7 +173,7 @@ def tune_rabi(
     if update:
         pulse.amp = new_amp
         print(
-            f"Updating {qubit.name} unit amp from {old_amp:.2e} to {new_amp:.2e}.",
+            f"Updating {qubit.name} unit amp from {old_amp:.5e} to {new_amp:.5e}.",
             flush=True,
         )
     if verify:
@@ -400,6 +424,7 @@ def tune_drag(
     mode_name="qubit",
     pulse_name=None,
     drag_range=(-5, 5, 21),
+    num_repeats=1,
     progbar=True,
     plot=True,
     ax=None,
@@ -452,16 +477,20 @@ def tune_drag(
     for drag in progbar(drags):
         pulse.drag = drag
         seq = get_sequence(system)
-        qubit.rotate_x(np.pi, pulse_name=pulse_name)
-        sync()
-        qubit.rotate_y(np.pi / 2, pulse_name=pulse_name)
+        for idx in range(num_repeats):
+            qubit.rotate_x(np.pi, pulse_name=pulse_name)
+            sync()
+            qubit.rotate_y(np.pi / 2, pulse_name=pulse_name)
+            sync()
         result = seq.run(init_state, e_ops=e_ops, only_final_state=False)
         XpY9.append(result.expect[0][-1])
 
         seq = get_sequence(system)
-        qubit.rotate_y(np.pi, pulse_name=pulse_name)
-        sync()
-        qubit.rotate_x(np.pi / 2, pulse_name=pulse_name)
+        for _ in range(num_repeats):
+            qubit.rotate_y(np.pi, pulse_name=pulse_name)
+            sync()
+            qubit.rotate_x(np.pi / 2, pulse_name=pulse_name)
+            sync()
         result = seq.run(init_state, e_ops=e_ops, only_final_state=False)
         YpX9.append(result.expect[0][-1])
 
@@ -481,7 +510,7 @@ def tune_drag(
         ax.plot(drags, r0.best_fit, "k-")
         ax.plot(drags, YpX9, "o", label="Ry(pi) - Rx(pi/2)")
         ax.plot(drags, r1.best_fit, "k-")
-        ax.axvline(xopt, color="k", ls="--", label=f"DRAG: {xopt:.2e}")
+        ax.axvline(xopt, color="k", ls="--", label=f"DRAG: {xopt:.5e}")
         ax.legend(loc=0)
         ax.grid(True)
         ax.set_xlabel("DRAG coefficient")
@@ -495,12 +524,136 @@ def tune_drag(
     if update:
         pulse.drag = xopt
         print(
-            f"Updating {pulse.name}.drag from {old_drag:.2e} to {xopt:.2e}.",
+            f"Updating {pulse.name}.drag from {old_drag:.5e} to {xopt:.5e}.",
             flush=True,
         )
     else:
         pulse.drag = old_drag
     return (fig, ax), old_drag, xopt
+
+
+def tune_repeated_drag(
+    system,
+    mode_name="qubit",
+    pulse_name=None,
+    max_num_pulses=100,
+    progbar=True,
+    plot=True,
+    ax=None,
+    ylabel=None,
+    update=True,
+    verify=True,
+):
+    """Tune the DRAG coefficient of a Transmon pulse by playing train of pi and pi/2 pulses.
+        U = (X(pi) Y(-pi) X(pi) Y(pi))^N X(pi/2)
+
+    Args:
+        system (System): System containing the Transmon whose
+            pulse you want to tune.
+        init_state (qutip.Qobj): Initial state of the system.
+        mode_name (optional, str): Name of the Transmon mode. Default: 'qubit'.
+        pulse_name (optional, str): Name of the pulse to tune. If None,
+            will use transmon.default_pulse. Default: None.
+        max_num_pulses (optional, tuple[float, float, int]): Maximum number of
+            repeated pulses, Default: 100.
+        progbar (optional, bool): Whether to display a tqdm progress bar.
+            Default: True.
+        plot (optional, bool): Whether to plot the results: Default: True.
+        ax (optional, matplotlib axis): Axis on which to plot results. If None,
+            one is automatically created. Default: None.
+        ylabel (optional, str): ylabel for the plot. Default: None.
+        update (optional, bool): Whether to update the pulse amplitude based on
+            the fit result. Default: True.
+        verify (optional, bool): Whether to re-run the Rabi sequence with the
+            newly-determined amplitude to verify correctness. Default: True.
+
+    Returns:
+        tuple[tuple, float, float]: (fig, ax), old_amp, new_amp
+    """
+
+    qubit = system.get_mode(mode_name)
+    pulse_name = pulse_name or qubit.default_pulse
+    pulse = getattr(qubit, pulse_name)
+
+    with system.use_modes(mode_name):
+        init_state = system.ground_state()
+        init_state = ket2dm(init_state)
+        e_ops = qubit.fock_dm(0)
+        # if e_ops is None:
+        #     e_ops = [init_state]
+        e_ops = ops2dms(e_ops)
+        
+        e_pop = []
+        num_pulses = np.arange(max_num_pulses + 1)
+        current_state = init_state
+
+        # initial pi/2 pulse
+        seq = get_sequence(system)
+        qubit.rotate_x(np.pi / 2, pulse_name=pulse_name)
+        sync()
+        result = seq.run(current_state, e_ops=e_ops, only_final_state=False)
+        current_state = result.states[-1]
+        e_pop.append(result.expect[0][-1])
+
+        # Repeated pulses
+        prog = tqdm if progbar else lambda x, **kwargs: x
+        for _ in prog(num_pulses[1:]):
+            seq = get_sequence(system)
+            qubit.rotate_y(np.pi, pulse_name=pulse_name)
+            qubit.rotate_x(np.pi, pulse_name=pulse_name)
+            qubit.rotate_y(-np.pi, pulse_name=pulse_name)
+            qubit.rotate_x(np.pi, pulse_name=pulse_name)
+            sync()
+            result = seq.run(current_state, e_ops=e_ops, only_final_state=False)
+            current_state = result.states[-1]
+            e_pop.append(result.expect[0][-1])
+    e_pop = np.array(e_pop)
+    
+    fit_result = fit_repeated_drag(num_pulses, e_pop)
+    drag_scale = 1 + fit_result.params['error'].value
+    print(drag_scale)
+    
+    old_drag = pulse.drag
+    new_drag = old_drag / drag_scale
+
+    if plot:
+        if ax is None:
+            fig, ax = plt.subplots(1, 1)
+        else:
+            fig = plt.gcf()
+        ax.plot(num_pulses, e_pop, "o")
+        ax.plot(num_pulses, fit_result.best_fit, "-")
+        ax.set_xlabel("Number of pulses")
+        if ylabel:
+            ax.set_ylabel(ylabel)
+        ax.grid(True)
+        ax.set_title(f"{pulse.name} Repeated DRAG pulses")
+        plt.pause(0.1)
+    else:
+        fig = None
+        ax = None
+    if update:
+        pulse.drag = new_drag
+        print(
+            f"Updating {pulse.name}.drag from {old_drag:.5e} to {new_drag:.5e}.",
+            flush=True,
+        )
+    else:
+        pulse.drag = old_drag
+    if verify:
+        _ = tune_repeated_drag(
+            system,
+            mode_name=mode_name,
+            pulse_name=pulse_name,
+            max_num_pulses=max_num_pulses,
+            progbar=progbar,
+            plot=True,
+            ax=ax,
+            ylabel=ylabel,
+            update=False,
+            verify=False,
+        )
+    return (fig, ax), old_drag, new_drag
 
 
 def tune_displacement(
@@ -589,7 +742,7 @@ def tune_displacement(
     if update:
         pulse.amp = new_amp
         print(
-            f"Updating {cavity.name} unit amp from {old_amp:.2e} to {new_amp:.2e}.",
+            f"Updating {cavity.name} unit amp from {old_amp:.5e} to {new_amp:.5e}.",
             flush=True,
         )
     if verify:
